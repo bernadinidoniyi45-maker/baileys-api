@@ -7,71 +7,65 @@ import fs from 'fs';
 
 const app = express();
 app.use(express.json());
+// CORS est obligatoire pour que le site Setzap puisse parler à ton serveur Render
 app.use(cors());
 
 const PORT = process.env.PORT || 3000;
 const API_KEY = process.env.API_KEY || 'SetzapSecret2026';
 const sessions = new Map();
 
-// Middleware pour vérifier l'API key (Compatible Setzap et Header simple)
+// --- AUTHENTIFICATION ---
 const authMiddleware = (req, res, next) => {
+  const authHeader = req.headers.authorization;
   const apiKeyHeader = req.headers['x-api-key'];
-  const authHeader = req.headers.authorization; // Setzap envoie souvent "Bearer CLÉ"
   
   let token = apiKeyHeader;
+  
+  // Setzap envoie souvent la clé sous la forme "Bearer MaCle"
   if (!token && authHeader && authHeader.startsWith('Bearer ')) {
     token = authHeader.split(' ')[1];
   }
 
+  // Si la clé ne correspond pas, on bloque
   if (token !== API_KEY) {
-    return res.status(401).json({ success: false, error: 'Invalid API key' });
+    return res.status(401).json({ error: 'Non autorisé: Clé API incorrecte' });
   }
   next();
 };
 
-// Route de base pour vérifier que le serveur tourne
+// --- ROUTE D'ACCUEIL (Juste pour vérifier que le serveur est allumé) ---
 app.get('/', (req, res) => {
-  res.send('Baileys API is running! 🚀');
+  res.send('Serveur actif. Retournez sur Setzap pour scanner le QR Code.');
 });
 
-// Générer un QR code
-app.post('/generate-qr', authMiddleware, async (req, res) => {
-  const { sessionId, webhookUrl } = req.body;
-  const safeSessionId = sessionId || 'default';
+// --- ROUTE DE CONNEXION (Celle que Setzap appelle) ---
+app.post('/api/sessions/create', authMiddleware, async (req, res) => {
+  const { sessionId } = req.body;
+  const safeSessionId = sessionId || 'session_defaut';
 
   try {
-    // Création du dossier auth s'il n'existe pas
-    if (!fs.existsSync(`auth_${safeSessionId}`)) {
-        // fs.mkdirSync(`auth_${safeSessionId}`, { recursive: true }); 
-        // Baileys le crée souvent tout seul, mais c'est plus sûr
-    }
-
-    const { state, saveCreds } = await useMultiFileAuthState(`./auth_${safeSessionId}`);
+    // Création d'une session unique
+    const { state, saveCreds } = await useMultiFileAuthState(`auth_info_${safeSessionId}`);
     
     const sock = makeWASocket({
       auth: state,
-      printQRInTerminal: false,
+      printQRInTerminal: true,
       logger: P({ level: 'silent' })
     });
 
     let qrCodeData = null;
 
+    // Écoute des événements WhatsApp
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        // Conversion du QR code en image base64 pour l'afficher sur Setzap
+        // Conversion du QR code en image pour Setzap
         qrCodeData = await QRCode.toDataURL(qr);
       }
 
       if (connection === 'close') {
         const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-        
-        if (webhookUrl) {
-            // Notification Webhook (optionnel)
-             console.log('Déconnexion, notification webhook...');
-        }
-
         if (!shouldReconnect) {
           sessions.delete(safeSessionId);
         }
@@ -83,46 +77,34 @@ app.post('/generate-qr', authMiddleware, async (req, res) => {
 
     sock.ev.on('creds.update', saveCreds);
 
-    // Attendre le QR code (max 10 secondes)
+    // Attente du QR code (max 20 secondes)
     for (let i = 0; i < 20; i++) {
       if (qrCodeData) break;
-      await new Promise(resolve => setTimeout(resolve, 500));
+      await new Promise(resolve => setTimeout(resolve, 1000));
     }
 
     if (!qrCodeData) {
-      return res.status(500).json({ success: false, error: 'Timeout: QR code non généré' });
+      return res.status(500).json({ error: 'Délai dépassé pour le QR Code' });
     }
 
-    // Réponse au format attendu
+    // Envoi de la réponse à Setzap
     res.json({ success: true, qrCode: qrCodeData });
 
   } catch (error) {
-    console.error(error);
-    res.status(500).json({ success: false, error: error.message });
+    console.error("Erreur:", error);
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Envoyer un message
-app.post('/send-message', authMiddleware, async (req, res) => {
+// --- ROUTE D'ENVOI DE MESSAGE ---
+app.post('/api/messages/send', authMiddleware, async (req, res) => {
   const { sessionId, to, message } = req.body;
-  const safeSessionId = sessionId || 'default';
-  
-  // On tente de recharger la session si elle n'est pas en mémoire mais existe sur le disque
-  if (!sessions.has(safeSessionId)) {
-      // Logique simplifiée : Idéalement, il faudrait réinitialiser le socket ici
-      // Pour l'instant, on retourne une erreur si le socket n'est pas chaud
-      // return res.status(404).json({ success: false, error: 'Session non active. Scannez le QR code.' });
-  }
-
-  // Note: Si la session est perdue au redémarrage serveur (Render/Railway gratuit), 
-  // il faut rescanner ou implémenter une logique de reconnexion au démarrage.
-  // Pour ce test simple, on suppose que la session est en RAM.
+  const safeSessionId = sessionId || 'session_defaut';
   
   const sock = sessions.get(safeSessionId);
 
-  // Si pas de socket en mémoire, on essaie de l'initialiser (Bonus robustesse)
   if (!sock) {
-     return res.status(404).json({ success: false, error: 'Session introuvable. Veuillez rescanner le QR.' });
+    return res.status(404).json({ error: 'Session non trouvée. Veuillez reconnecter le QR.' });
   }
 
   try {
@@ -130,11 +112,10 @@ app.post('/send-message', authMiddleware, async (req, res) => {
     await sock.sendMessage(jid, { text: message });
     res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Démarrage du serveur (C'est la partie qui manquait !)
 app.listen(PORT, () => {
-  console.log(`Serveur Baileys démarré sur le port ${PORT}`);
+  console.log(`Serveur prêt sur le port ${PORT}`);
 });
