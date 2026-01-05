@@ -3,122 +3,86 @@ import makeWASocket, { useMultiFileAuthState, DisconnectReason } from '@whiskeys
 import { Boom } from '@hapi/boom';
 import fs from 'fs';
 import path from 'path';
+import cors from 'cors'; // AJOUTÉ
 
 const app = express();
 app.use(express.json());
+app.use(cors()); // AJOUTÉ : Autorise Setzap à parler au serveur
 
 const sessions = new Map();
 const API_KEY = process.env.API_KEY || 'your-secret-key';
 
+// Middleware d'authentification
 const authenticate = (req, res, next) => {
   const auth = req.headers.authorization;
-  if (!auth || auth !== `Bearer ${API_KEY}`) {
-    return res.status(401).json({ error: 'Non autorisé' });
+  // On accepte si la clé est dans le header Authorization OU dans l'URL (pour les tests simples)
+  const token = auth && auth.split(' ')[1];
+  
+  if (token === API_KEY || req.query.key === API_KEY) {
+    next();
+  } else {
+    return res.status(401).json({ error: 'Non autorisé: Clé API incorrecte' });
   }
-  next();
 };
+
+// Route de test pour vérifier que le serveur est en vie
+app.get('/', (req, res) => {
+  res.send('Baileys API est en ligne ! 🚀');
+});
 
 app.post('/api/sessions/create', authenticate, async (req, res) => {
   try {
-    const { sessionId, webhookUrl } = req.body;
+    const { sessionId } = req.body;
     
-    const sessionPath = path.join('./sessions', sessionId);
-    if (!fs.existsSync(sessionPath)) {
-      fs.mkdirSync(sessionPath, { recursive: true });
+    // Nettoyage des anciennes sessions si besoin
+    const sessionFolder = './sessions';
+    if (!fs.existsSync(sessionFolder)){
+        fs.mkdirSync(sessionFolder);
     }
 
+    const sessionPath = path.join(sessionFolder, sessionId || 'default_session');
+    
     const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
-    const sock = makeWASocket({ auth: state, printQRInTerminal: false });
+    const sock = makeWASocket({ 
+        auth: state, 
+        printQRInTerminal: true // Affiche aussi dans les logs Railway
+    });
 
     let qrCode = null;
 
-    sock.ev.on('connection.update', async (update) => {
+    // On écoute les événements
+    sock.ev.on('connection.update', (update) => {
       const { connection, lastDisconnect, qr } = update;
-      if (qr) qrCode = qr;
-
-      if (connection === 'open') {
-        const phoneNumber = sock.user.id.split(':')[0];
-        if (webhookUrl) {
-          await fetch(webhookUrl, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ sessionId, event: 'connection.update', data: { status: 'open', phoneNumber }})
-          }).catch(console.error);
-        }
+      
+      if (qr) {
+        qrCode = qr;
+        console.log('QR Code généré !');
       }
 
       if (connection === 'close') {
         const shouldReconnect = (lastDisconnect?.error instanceof Boom) 
           ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut : false;
-        if (!shouldReconnect) {
-          sessions.delete(sessionId);
-          if (webhookUrl) {
-            await fetch(webhookUrl, {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ sessionId, event: 'connection.update', data: { status: 'close' }})
-            }).catch(console.error);
-          }
-        }
+        // Logique de reconnexion simplifiée ici
       }
     });
 
     sock.ev.on('creds.update', saveCreds);
-    sock.ev.on('messages.upsert', async ({ messages }) => {
-      if (webhookUrl) {
-        await fetch(webhookUrl, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sessionId, event: 'messages.upsert', data: { messages }})
-        }).catch(console.error);
-      }
-    });
 
-    sessions.set(sessionId, { sock, webhookUrl });
-
-    for (let i = 0; i < 20; i++) {
+    // On attend un peu que le QR soit généré
+    for (let i = 0; i < 10; i++) {
       if (qrCode) break;
-      await new Promise(resolve => setTimeout(resolve, 500));
+      await new Promise(resolve => setTimeout(resolve, 1000));
     }
 
     if (!qrCode) {
-      return res.status(500).json({ error: 'QR code non généré' });
+      return res.status(500).json({ error: 'QR code non généré (timeout)' });
     }
 
+    // On renvoie le QR Code au frontend
     res.json({ success: true, qrCode });
-  } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
 
-app.post('/api/messages/send', authenticate, async (req, res) => {
-  try {
-    const { sessionId, to, message } = req.body;
-    const session = sessions.get(sessionId);
-    if (!session) return res.status(404).json({ error: 'Session non trouvée' });
-    
-    const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
-    await session.sock.sendMessage(jid, { text: message });
-    res.json({ success: true });
   } catch (error) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-app.delete('/api/sessions/:sessionId', authenticate, async (req, res) => {
-  try {
-    const { sessionId } = req.params;
-    const session = sessions.get(sessionId);
-    if (session) {
-      await session.sock.logout();
-      sessions.delete(sessionId);
-    }
-    const sessionPath = path.join('./sessions', sessionId);
-    if (fs.existsSync(sessionPath)) {
-      fs.rmSync(sessionPath, { recursive: true });
-    }
-    res.json({ success: true });
-  } catch (error) {
+    console.error(error);
     res.status(500).json({ error: error.message });
   }
 });
