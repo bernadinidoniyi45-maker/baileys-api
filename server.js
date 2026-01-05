@@ -1,7 +1,7 @@
 import express from 'express';
 import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, Browsers } = require('@whiskeysockets/baileys');
 import QRCode from 'qrcode';
 import P from 'pino';
 import cors from 'cors';
@@ -17,122 +17,98 @@ const sessions = new Map();
 
 // --- AUTHENTIFICATION ---
 const authMiddleware = (req, res, next) => {
-  const authHeader = req.headers.authorization;
-  const apiKeyHeader = req.headers['x-api-key'];
-  let token = apiKeyHeader;
-  if (!token && authHeader && authHeader.startsWith('Bearer ')) {
-    token = authHeader.split(' ')[1];
-  }
-  if (token !== API_KEY) {
-    return res.status(401).json({ error: 'Non autorisé' });
-  }
+  const token = req.headers['x-api-key'] || (req.headers.authorization?.split(' ')[1]);
+  if (token !== API_KEY) return res.status(401).json({ error: 'Non autorisé' });
   next();
 };
 
-app.get('/', (req, res) => {
-  res.send('Serveur V4 (Turbo) en ligne.');
-});
+app.get('/', (req, res) => res.send('Serveur V5 (Ultra-Light) prêt.'));
 
-// --- ROUTE DE GÉNÉRATION QR OPTIMISÉE ---
+// --- ROUTE DE GÉNÉRATION QR ---
 app.post('/api/sessions/create', authMiddleware, async (req, res) => {
   const { sessionId } = req.body;
   const safeSessionId = sessionId || 'session_defaut';
   const authFolder = `auth_info_${safeSessionId}`;
 
   try {
-    console.log(`[Début] Tentative de connexion pour : ${safeSessionId}`);
+    console.log(`[V5] Démarrage pour : ${safeSessionId}`);
 
-    // 1. NETTOYAGE AGRESSIF : On supprime tout pour repartir à neuf
+    // Nettoyage radical
     if (fs.existsSync(authFolder)) {
-      try {
-        fs.rmSync(authFolder, { recursive: true, force: true });
-        console.log('Ancienne session supprimée.');
-      } catch (e) {
-        console.log('Erreur nettoyage (pas grave) :', e.message);
-      }
+      fs.rmSync(authFolder, { recursive: true, force: true });
     }
 
     const { state, saveCreds } = await useMultiFileAuthState(authFolder);
     
-    // 2. CONFIGURATION "TURBO" POUR SERVEUR GRATUIT
+    // CONFIGURATION MINIMALE (Pour éviter d'être détecté comme un bot)
     const sock = makeWASocket({
       auth: state,
       printQRInTerminal: true,
       logger: P({ level: 'silent' }),
-      browser: ["Ubuntu", "Chrome", "20.0.04"], // Mieux toléré par WhatsApp sur serveur
-      connectTimeoutMs: 60000,
-      defaultQueryTimeoutMs: 0, // Ne jamais abandonner
-      keepAliveIntervalMs: 10000, // Garder la connexion éveillée
-      emitOwnEvents: true,
-      retryRequestDelayMs: 250
+      browser: Browsers.ubuntu('Chrome'), // Signature standard
+      connectTimeoutMs: 20000, // On réduit le timeout pour forcer une réponse rapide
     });
 
     let qrCodeData = null;
 
     sock.ev.on('connection.update', async (update) => {
       const { connection, lastDisconnect, qr } = update;
+      
+      // On loggue tout pour comprendre
+      console.log(`[État Connexion] : ${connection || 'en cours...'}`);
 
       if (qr) {
-        console.log('>>> QR CODE REÇU DE WHATSAPP ! <<<');
+        console.log('>>> QR CODE GÉNÉRÉ ! <<<');
         qrCodeData = await QRCode.toDataURL(qr);
       }
 
       if (connection === 'close') {
          const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-         if(!shouldReconnect) {
-             sessions.delete(safeSessionId);
-         }
+         if(!shouldReconnect) sessions.delete(safeSessionId);
       } else if (connection === 'open') {
         sessions.set(safeSessionId, sock);
-        console.log('Connexion établie avec succès !');
+        console.log('Connexion RÉUSSIE !');
       }
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    // 3. ATTENTE ÉTENDUE (On attend jusqu'à 90 secondes si besoin)
-    for (let i = 0; i < 90; i++) {
+    // Attente (40 secondes max)
+    for (let i = 0; i < 40; i++) {
       if (qrCodeData) break;
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
 
     if (!qrCodeData) {
-      console.log('Echec: Le serveur est trop lent ou WhatsApp bloque l\'IP.');
-      return res.status(500).json({ error: 'Délai dépassé. Réessayez.' });
+      console.log('Échec : Pas de QR reçu.');
+      return res.status(500).json({ error: 'WhatsApp ne répond pas (IP possiblement bloquée).' });
     }
-    
-    // Réponse complète
+
     res.json({
       success: true,
       qrCode: qrCodeData,
-      qrcode: qrCodeData,
-      base64: qrCodeData,
-      url: qrCodeData
+      qrcode: qrCodeData, // Compatibilité Setzap
+      base64: qrCodeData
     });
 
   } catch (error) {
-    console.error("Erreur critique:", error);
+    console.error("Erreur V5:", error);
     res.status(500).json({ error: error.message });
   }
 });
 
 // --- ENVOI MESSAGE ---
 app.post('/api/messages/send', authMiddleware, async (req, res) => {
-  const { sessionId, to, message } = req.body;
-  const safeSessionId = sessionId || 'session_defaut';
-  const sock = sessions.get(safeSessionId);
-
-  if (!sock) return res.status(404).json({ error: 'Session non connectée' });
+  const sock = sessions.get(req.body.sessionId || 'session_defaut');
+  if (!sock) return res.status(404).json({ error: 'Non connecté' });
 
   try {
-    const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
-    await sock.sendMessage(jid, { text: message });
+    const jid = req.body.to.includes('@') ? req.body.to : `${req.body.to}@s.whatsapp.net`;
+    await sock.sendMessage(jid, { text: req.body.message });
     res.json({ success: true });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Serveur V4 prêt sur le port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Serveur V5 sur le port ${PORT}`));
