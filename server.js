@@ -1,11 +1,7 @@
 import express from 'express';
-import { createRequire } from 'module'; // Nécessaire pour la compatibilité
+import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
-
-// --- IMPORTATION BLINDÉE DE BAILEYS ---
-// Ceci corrige l'erreur "makeWASocket is not a function"
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
-
 import QRCode from 'qrcode';
 import P from 'pino';
 import cors from 'cors';
@@ -23,40 +19,44 @@ const sessions = new Map();
 const authMiddleware = (req, res, next) => {
   const authHeader = req.headers.authorization;
   const apiKeyHeader = req.headers['x-api-key'];
-  
   let token = apiKeyHeader;
   if (!token && authHeader && authHeader.startsWith('Bearer ')) {
     token = authHeader.split(' ')[1];
   }
-
   if (token !== API_KEY) {
-    return res.status(401).json({ error: 'Non autorisé: Clé API incorrecte' });
+    return res.status(401).json({ error: 'Non autorisé' });
   }
   next();
 };
 
 app.get('/', (req, res) => {
-  res.send('Serveur actif. Retournez sur Setzap pour scanner le QR Code.');
+  res.send('Serveur actif v3 (Mode Nettoyage). Prêt pour Setzap.');
 });
 
-// --- ROUTE DE CONNEXION ---
+// --- ROUTE DE GÉNÉRATION QR (Version Robuste) ---
 app.post('/api/sessions/create', authMiddleware, async (req, res) => {
   const { sessionId } = req.body;
   const safeSessionId = sessionId || 'session_defaut';
+  const authFolder = `auth_info_${safeSessionId}`;
 
   try {
-    // Création du dossier si inexistant (sécurité supplémentaire)
-    if (!fs.existsSync(`auth_info_${safeSessionId}`)) {
-       // fs.mkdirSync(`auth_info_${safeSessionId}`, { recursive: true });
+    console.log(`Démarrage session ${safeSessionId}...`);
+
+    // 1. NETTOYAGE FORCE : On supprime le dossier existant pour éviter les bugs de "session coincée"
+    if (fs.existsSync(authFolder)) {
+      console.log('Suppression des anciens fichiers de session...');
+      fs.rmSync(authFolder, { recursive: true, force: true });
     }
 
-    const { state, saveCreds } = await useMultiFileAuthState(`auth_info_${safeSessionId}`);
+    // 2. Création de la nouvelle session
+    const { state, saveCreds } = await useMultiFileAuthState(authFolder);
     
-    // C'est ici que ça plantait avant. Avec le "require" au début, ça va marcher.
     const sock = makeWASocket({
       auth: state,
       printQRInTerminal: true,
-      logger: P({ level: 'silent' })
+      logger: P({ level: 'silent' }), // On cache les logs techniques inutiles
+      browser: ["Setzap", "Chrome", "1.0.0"], // Simule un vrai navigateur
+      connectTimeoutMs: 60000, // On laisse 1 minute pour se connecter
     });
 
     let qrCodeData = null;
@@ -65,33 +65,39 @@ app.post('/api/sessions/create', authMiddleware, async (req, res) => {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
+        console.log('QR Code reçu de WhatsApp !');
         qrCodeData = await QRCode.toDataURL(qr);
       }
 
       if (connection === 'close') {
-        const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-        if (!shouldReconnect) {
-          sessions.delete(safeSessionId);
-        }
+         // Gestion simple de la déconnexion
+         const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+         if(!shouldReconnect) {
+             sessions.delete(safeSessionId);
+         }
       } else if (connection === 'open') {
         sessions.set(safeSessionId, sock);
-        console.log(`Session ${safeSessionId} connectée !`);
+        console.log('Connexion réussie !');
       }
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    // Attente du QR code
-    for (let i = 0; i < 20; i++) {
+    // 3. ATTENTE LONGUE (60 secondes)
+    // On laisse le temps au serveur gratuit de se réveiller
+    for (let i = 0; i < 60; i++) {
       if (qrCodeData) break;
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
 
     if (!qrCodeData) {
-      return res.status(500).json({ error: 'Délai dépassé pour le QR Code' });
+      console.log('Echec: Pas de QR code après 60s');
+      return res.status(500).json({ error: 'Trop lent. Réessayez une fois.' });
     }
 
-    // Réponse compatible avec Setzap (Correction "undefined")
+    console.log('Succès : Envoi du QR Code à Setzap');
+    
+    // Réponse compatible avec Setzap
     res.json({
       success: true,
       qrCode: qrCodeData,
@@ -101,22 +107,18 @@ app.post('/api/sessions/create', authMiddleware, async (req, res) => {
     });
 
   } catch (error) {
-    console.error("Erreur serveur:", error);
-    // On renvoie l'erreur précise pour le debug
-    res.status(500).json({ error: error.message, stack: error.stack });
+    console.error("Erreur critique:", error);
+    res.status(500).json({ error: error.message });
   }
 });
 
-// --- ENVOI DE MESSAGE ---
+// --- ENVOI MESSAGE ---
 app.post('/api/messages/send', authMiddleware, async (req, res) => {
   const { sessionId, to, message } = req.body;
   const safeSessionId = sessionId || 'session_defaut';
-  
   const sock = sessions.get(safeSessionId);
 
-  if (!sock) {
-    return res.status(404).json({ error: 'Session non trouvée. Veuillez reconnecter le QR.' });
-  }
+  if (!sock) return res.status(404).json({ error: 'Session non connectée' });
 
   try {
     const jid = to.includes('@') ? to : `${to}@s.whatsapp.net`;
