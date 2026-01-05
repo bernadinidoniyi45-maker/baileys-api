@@ -30,33 +30,41 @@ const authMiddleware = (req, res, next) => {
 };
 
 app.get('/', (req, res) => {
-  res.send('Serveur actif v3 (Mode Nettoyage). Prêt pour Setzap.');
+  res.send('Serveur V4 (Turbo) en ligne.');
 });
 
-// --- ROUTE DE GÉNÉRATION QR (Version Robuste) ---
+// --- ROUTE DE GÉNÉRATION QR OPTIMISÉE ---
 app.post('/api/sessions/create', authMiddleware, async (req, res) => {
   const { sessionId } = req.body;
   const safeSessionId = sessionId || 'session_defaut';
   const authFolder = `auth_info_${safeSessionId}`;
 
   try {
-    console.log(`Démarrage session ${safeSessionId}...`);
+    console.log(`[Début] Tentative de connexion pour : ${safeSessionId}`);
 
-    // 1. NETTOYAGE FORCE : On supprime le dossier existant pour éviter les bugs de "session coincée"
+    // 1. NETTOYAGE AGRESSIF : On supprime tout pour repartir à neuf
     if (fs.existsSync(authFolder)) {
-      console.log('Suppression des anciens fichiers de session...');
-      fs.rmSync(authFolder, { recursive: true, force: true });
+      try {
+        fs.rmSync(authFolder, { recursive: true, force: true });
+        console.log('Ancienne session supprimée.');
+      } catch (e) {
+        console.log('Erreur nettoyage (pas grave) :', e.message);
+      }
     }
 
-    // 2. Création de la nouvelle session
     const { state, saveCreds } = await useMultiFileAuthState(authFolder);
     
+    // 2. CONFIGURATION "TURBO" POUR SERVEUR GRATUIT
     const sock = makeWASocket({
       auth: state,
       printQRInTerminal: true,
-      logger: P({ level: 'silent' }), // On cache les logs techniques inutiles
-      browser: ["Setzap", "Chrome", "1.0.0"], // Simule un vrai navigateur
-      connectTimeoutMs: 60000, // On laisse 1 minute pour se connecter
+      logger: P({ level: 'silent' }),
+      browser: ["Ubuntu", "Chrome", "20.0.04"], // Mieux toléré par WhatsApp sur serveur
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: 0, // Ne jamais abandonner
+      keepAliveIntervalMs: 10000, // Garder la connexion éveillée
+      emitOwnEvents: true,
+      retryRequestDelayMs: 250
     });
 
     let qrCodeData = null;
@@ -65,39 +73,35 @@ app.post('/api/sessions/create', authMiddleware, async (req, res) => {
       const { connection, lastDisconnect, qr } = update;
 
       if (qr) {
-        console.log('QR Code reçu de WhatsApp !');
+        console.log('>>> QR CODE REÇU DE WHATSAPP ! <<<');
         qrCodeData = await QRCode.toDataURL(qr);
       }
 
       if (connection === 'close') {
-         // Gestion simple de la déconnexion
          const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
          if(!shouldReconnect) {
              sessions.delete(safeSessionId);
          }
       } else if (connection === 'open') {
         sessions.set(safeSessionId, sock);
-        console.log('Connexion réussie !');
+        console.log('Connexion établie avec succès !');
       }
     });
 
     sock.ev.on('creds.update', saveCreds);
 
-    // 3. ATTENTE LONGUE (60 secondes)
-    // On laisse le temps au serveur gratuit de se réveiller
-    for (let i = 0; i < 60; i++) {
+    // 3. ATTENTE ÉTENDUE (On attend jusqu'à 90 secondes si besoin)
+    for (let i = 0; i < 90; i++) {
       if (qrCodeData) break;
       await new Promise(resolve => setTimeout(resolve, 1000));
     }
 
     if (!qrCodeData) {
-      console.log('Echec: Pas de QR code après 60s');
-      return res.status(500).json({ error: 'Trop lent. Réessayez une fois.' });
+      console.log('Echec: Le serveur est trop lent ou WhatsApp bloque l\'IP.');
+      return res.status(500).json({ error: 'Délai dépassé. Réessayez.' });
     }
-
-    console.log('Succès : Envoi du QR Code à Setzap');
     
-    // Réponse compatible avec Setzap
+    // Réponse complète
     res.json({
       success: true,
       qrCode: qrCodeData,
@@ -130,5 +134,5 @@ app.post('/api/messages/send', authMiddleware, async (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Serveur prêt sur le port ${PORT}`);
+  console.log(`Serveur V4 prêt sur le port ${PORT}`);
 });
